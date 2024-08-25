@@ -19,6 +19,7 @@ _client_id = '861556708454-d6dlm3lh05idd8npek18k6be8ba3oc68.apps.googleuserconte
 _client_secret = 'SboVhoG9s0rNafixCSGGKXAT'
 
 # Extracted API keys -- unclear what these are linked to.
+# API keys are not required, see: https://github.com/TeamNewPipe/NewPipeExtractor/pull/1168
 _api_keys = [
     'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8',
     'AIzaSyCtkvNIR1HCEwzsqK6JuE6KqpyjusIRI30',
@@ -413,40 +414,54 @@ _cache_dir = pathlib.Path(__file__).parent.resolve() / '__cache__'
 _token_file = os.path.join(_cache_dir, 'tokens.json')
 
 
+def _default_oauth_verifier(verification_url: str, user_code: str):
+    """ Default `print(...)` and `input(...)` for oauth verification """
+    print(f'Please open {verification_url} and input code {user_code}')
+    input('Press enter when you have completed this step.')
+
+
+
 class InnerTube:
     """Object for interacting with the innertube API."""
-    def __init__(self, client='ANDROID_MUSIC', use_oauth=False, allow_cache=True):
+
+    def __init__(self, client='ANDROID_TESTSUITE', use_oauth=False, allow_cache=True, token_file=None, oauth_verifier=None):
         """Initialize an InnerTube object.
 
         :param str client:
             Client to use for the object.
-            Default to web because it returns the most playback types.
+            The default is ANDROID_TESTSUITE because there is no need to decrypt the
+            signature cipher and throttling parameter.
         :param bool use_oauth:
             Whether or not to authenticate to YouTube.
         :param bool allow_cache:
             Allows caching of oauth tokens on the machine.
+        :param Callable oauth_verifier:
+            Verifier to be used for getting outh tokens. 
+            Verification URL and User-Code will be passed to it respectively. 
+            (if passed, else default verifier will be used)
         """
-        self.context = _default_clients[client]['innertube_context']
+        self.innertube_context = _default_clients[client]['innertube_context']
         self.header = _default_clients[client]['header']
         self.api_key = _default_clients[client]['api_key']
+        self.require_js_player = _default_clients[client]['require_js_player']
         self.access_token = None
         self.refresh_token = None
         self.use_oauth = use_oauth
         self.allow_cache = allow_cache
+        self.oauth_verifier = oauth_verifier or _default_oauth_verifier
 
         # Stored as epoch time
         self.expires = None
 
         # Try to load from file if specified
-        if self.use_oauth and self.allow_cache:
-            # Try to load from file if possible
-            if os.path.exists(_token_file):
-                with open(_token_file) as f:
-                    data = json.load(f)
-                    self.access_token = data['access_token']
-                    self.refresh_token = data['refresh_token']
-                    self.expires = data['expires']
-                    self.refresh_bearer_token()
+        self.token_file = token_file or _token_file
+        if self.use_oauth and self.allow_cache and os.path.exists(self.token_file):
+            with open(self.token_file) as f:
+                data = json.load(f)
+                self.access_token = data['access_token']
+                self.refresh_token = data['refresh_token']
+                self.expires = data['expires']
+                self.refresh_bearer_token()
 
     def cache_tokens(self):
         """Cache tokens to file if allowed."""
@@ -460,7 +475,7 @@ class InnerTube:
         }
         if not os.path.exists(_cache_dir):
             os.mkdir(_cache_dir)
-        with open(_token_file, 'w') as f:
+        with open(self.token_file, 'w') as f:
             json.dump(data, f)
 
     def refresh_bearer_token(self, force=False):
@@ -516,8 +531,7 @@ class InnerTube:
         response_data = json.loads(response.read())
         verification_url = response_data['verification_url']
         user_code = response_data['user_code']
-        print(f'Please open {verification_url} and input code {user_code}')
-        input('Press enter when you have completed this step.')
+        self.oauth_verifier(verification_url, user_code)
 
         data = {
             'client_id': _client_id,
@@ -546,26 +560,22 @@ class InnerTube:
         return 'https://www.youtube.com/youtubei/v1'
 
     @property
-    def base_data(self):
+    def base_data(self) -> dict:
         """Return the base json data to transmit to the innertube API."""
-        return {
-            'context': self.context
-        }
+        return self.innertube_context
 
     @property
     def base_params(self):
         """Return the base query parameters to transmit to the innertube API."""
         return {
-            'key': self.api_key,
-            'contentCheckOk': True,
-            'racyCheckOk': True
+            'prettyPrint': "false"
         }
 
     def _call_api(self, endpoint, query, data):
         """Make a request to a given endpoint with the provided query parameters and data."""
-        # Remove the API key if oauth is being used.
-        if self.use_oauth:
-            del query['key']
+        # When YouTube used an API key, it was necessary to remove it when using oauth
+        # if self.use_oauth:
+        #     del query['key']
 
         endpoint_url = f'{endpoint}?{parse.urlencode(query)}'
         headers = {
@@ -575,10 +585,10 @@ class InnerTube:
         if self.use_oauth:
             if self.access_token:
                 self.refresh_bearer_token()
-                headers['Authorization'] = f'Bearer {self.access_token}'
             else:
                 self.fetch_bearer_token()
-                headers['Authorization'] = f'Bearer {self.access_token}'
+
+            headers['Authorization'] = f'Bearer {self.access_token}'
 
         headers.update(self.header)
 
@@ -636,10 +646,9 @@ class InnerTube:
             Raw player info results.
         """
         endpoint = f'{self.base_url}/player'
-        query = {
-            'videoId': video_id,
-        }
-        query.update(self.base_params)
+        query = self.base_params
+
+        self.base_data.update({'videoId': video_id, 'contentCheckOk': "true"})
         return self._call_api(endpoint, query, self.base_data)
 
     def search(self, search_query, continuation=None):
@@ -652,11 +661,9 @@ class InnerTube:
             Raw search query results.
         """
         endpoint = f'{self.base_url}/search'
-        query = {
-            'query': search_query
-        }
-        query.update(self.base_params)
+        query = self.base_params
         data = {}
+        self.base_data.update({'query': search_query})
         if continuation:
             data['continuation'] = continuation
         data.update(self.base_data)
@@ -678,8 +685,10 @@ class InnerTube:
         endpoint = f'{self.base_url}/verify_age'
         data = {
             'nextEndpoint': {
-                'urlEndpoint': {
-                    'url': f'/watch?v={video_id}'
+                'watchEndpoint': {
+                    'racyCheckOk': True,
+                    'contentCheckOk': True,
+                    'videoId': video_id
                 }
             },
             'setControvercy': True
